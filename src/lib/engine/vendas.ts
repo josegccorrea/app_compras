@@ -16,11 +16,11 @@ export function carregarVendas(buffer: Buffer): {
   lojas: string[]
   semanas: string[]
 } {
-  const wb = XLSX.read(buffer, { type: 'buffer' })
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: false, cellNF: false, cellStyles: false })
   const ws = wb.Sheets[wb.SheetNames[0]]
   const raw: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws, {
     defval: '',
-    raw: false,
+    raw: true,
   })
 
   if (raw.length === 0) throw new Error('Arquivo de vendas vazio')
