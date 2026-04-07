@@ -1,0 +1,218 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { carregarCatalogo } from '@/lib/engine/catalogo'
+import { carregarVendas } from '@/lib/engine/vendas'
+import { carregarEstoquesZip } from '@/lib/engine/estoque'
+import { processar } from '@/lib/engine/reposicao'
+
+export const maxDuration = 60
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = await createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      return NextResponse.json({ error: 'Não autenticado' }, { status: 401 })
+    }
+
+    const form = await request.formData()
+    const catalogoFile = form.get('catalogo') as File | null
+    const vendasFile = form.get('vendas') as File | null
+    const estoquesFile = form.get('estoques') as File | null
+
+    if (!catalogoFile || !vendasFile || !estoquesFile) {
+      return NextResponse.json({ error: 'Arquivos incompletos' }, { status: 400 })
+    }
+
+    // Read buffers
+    const [catalogoBuf, vendasBuf, estoquesBuf] = await Promise.all([
+      catalogoFile.arrayBuffer().then(Buffer.from),
+      vendasFile.arrayBuffer().then(Buffer.from),
+      estoquesFile.arrayBuffer().then(Buffer.from),
+    ])
+
+    // Parse inputs
+    const catalogo = carregarCatalogo(catalogoBuf)
+    const { registros: vendasRegs, semanas } = carregarVendas(vendasBuf)
+    const { registros: estoquesRegs, lojas: nomesLojas } = await carregarEstoquesZip(estoquesBuf)
+
+    // Separate CD from store stocks
+    const estoqueCD = estoquesRegs.filter((r) =>
+      r.loja.toLowerCase().includes('cd') ||
+      r.loja.toLowerCase().includes('centro') ||
+      r.loja.toLowerCase() === 'cd'
+    )
+    const estoquesLojas = estoquesRegs.filter((r) => !estoqueCD.includes(r))
+
+    // Determine semana_iso for this upload (most recent)
+    const semanaRecente = semanas.sort().at(-1) ?? `${new Date().getFullYear()}-W${String(
+      Math.ceil((new Date().getDate() + new Date(new Date().getFullYear(), new Date().getMonth(), 1).getDay()) / 7)
+    ).padStart(2, '0')}`
+
+    // Check for existing upload for same semana
+    const { data: existing } = await supabase
+      .from('uploads')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('semana_iso', semanaRecente)
+      .single()
+
+    let uploadId: string
+
+    if (existing) {
+      uploadId = existing.id
+      await supabase.from('uploads').update({ status: 'processing' }).eq('id', uploadId)
+      // Clean previous data
+      await Promise.all([
+        supabase.from('catalogo').delete().eq('upload_id', uploadId),
+        supabase.from('vendas').delete().eq('upload_id', uploadId),
+        supabase.from('estoques').delete().eq('upload_id', uploadId),
+        supabase.from('sugestoes').delete().eq('upload_id', uploadId),
+        supabase.from('compras_cd').delete().eq('upload_id', uploadId),
+        supabase.from('sem_giro_cd').delete().eq('upload_id', uploadId),
+      ])
+    } else {
+      const { data: newUpload, error: uploadError } = await supabase
+        .from('uploads')
+        .insert({ user_id: user.id, semana_iso: semanaRecente, status: 'processing', meta: {} })
+        .select('id')
+        .single()
+
+      if (uploadError || !newUpload) {
+        return NextResponse.json({ error: 'Erro ao criar upload' }, { status: 500 })
+      }
+      uploadId = newUpload.id
+    }
+
+    // Run processing engine
+    const resultado = processar(
+      catalogo,
+      vendasRegs,
+      estoquesLojas,
+      estoqueCD,
+      nomesLojas.filter((l) => !l.toLowerCase().includes('cd')),
+    )
+
+    // Save catalogo
+    const catalogoRows = Array.from(catalogo.values()).map((c) => ({
+      upload_id: uploadId,
+      codigo: c.codigo,
+      descricao: c.descricao,
+      linha: c.linha,
+      tamanho: c.tamanho,
+      cor: c.cor,
+      marca: c.marca,
+      lote_minimo: c.lote_minimo,
+    }))
+    if (catalogoRows.length > 0) {
+      await supabase.from('catalogo').insert(catalogoRows)
+    }
+
+    // Save vendas in batches of 500
+    const BATCH = 500
+    const vendasRows = vendasRegs
+      .filter((v) => catalogo.has(v.codigo))
+      .map((v) => ({ upload_id: uploadId, semana_iso: v.semana_iso, loja: v.loja, codigo: v.codigo, quantidade: v.quantidade }))
+    for (let i = 0; i < vendasRows.length; i += BATCH) {
+      await supabase.from('vendas').insert(vendasRows.slice(i, i + BATCH))
+    }
+
+    // Save estoques
+    const estoquesRows = estoquesRegs
+      .filter((e) => catalogo.has(e.codigo))
+      .map((e) => ({
+        upload_id: uploadId,
+        loja: e.loja,
+        codigo: e.codigo,
+        quantidade: e.quantidade,
+        cod_barras: e.cod_barras ?? null,
+        descricao_sistema: e.descricao_sistema ?? null,
+      }))
+    for (let i = 0; i < estoquesRows.length; i += BATCH) {
+      await supabase.from('estoques').insert(estoquesRows.slice(i, i + BATCH))
+    }
+
+    // Save sugestoes
+    const sugestoesRows = Object.entries(resultado.lojas).flatMap(([, lojaData]) =>
+      lojaData.itens.map((item) => ({
+        upload_id: uploadId,
+        loja: item.loja,
+        codigo: item.codigo,
+        cod_barras: item.cod_barras,
+        descricao: item.descricao,
+        linha: item.linha,
+        tamanho: item.tamanho,
+        cor: item.cor,
+        estoque_atual: item.estoque_atual,
+        demanda_semanal: item.demanda_semanal,
+        demanda_diaria: item.demanda_diaria,
+        cobertura_dias: item.cobertura_dias,
+        status: item.status,
+        qtd_sugerida: item.qtd_sugerida,
+        qtd_disponivel_cd: item.qtd_disponivel_cd,
+        qtd_a_enviar: item.qtd_a_enviar,
+        lote_minimo: item.lote_minimo,
+        por_minimo: item.por_minimo,
+      }))
+    )
+    for (let i = 0; i < sugestoesRows.length; i += BATCH) {
+      await supabase.from('sugestoes').insert(sugestoesRows.slice(i, i + BATCH))
+    }
+
+    // Save compras_cd
+    const comprasRows = resultado.compras_cd.map((c) => ({
+      upload_id: uploadId,
+      codigo: c.codigo,
+      cod_barras: c.cod_barras,
+      descricao: c.descricao,
+      linha: c.linha,
+      tamanho: c.tamanho,
+      cor: c.cor,
+      estoque_cd: c.estoque_cd,
+      demanda_total_semanal: c.demanda_total_semanal,
+      cobertura_cd_dias: c.cobertura_cd_dias,
+      qtd_comprar: c.qtd_comprar,
+      lote_minimo: c.lote_minimo,
+      status_cd: c.status_cd,
+      prazos_pagamento: c.prazos_pagamento,
+    }))
+    if (comprasRows.length > 0) {
+      await supabase.from('compras_cd').insert(comprasRows)
+    }
+
+    // Save sem_giro_cd
+    const semGiroRows = resultado.sem_giro_cd.map((s) => ({
+      upload_id: uploadId,
+      codigo: s.codigo,
+      cod_barras: s.cod_barras,
+      descricao: s.descricao,
+      linha: s.linha,
+      tamanho: s.tamanho,
+      cor: s.cor,
+      estoque_cd: s.estoque_cd,
+      ultima_venda_semana: s.ultima_venda_semana,
+    }))
+    if (semGiroRows.length > 0) {
+      await supabase.from('sem_giro_cd').insert(semGiroRows)
+    }
+
+    // Update upload with meta and mark done
+    await supabase.from('uploads').update({
+      status: 'done',
+      meta: resultado.meta,
+    }).eq('id', uploadId)
+
+    return NextResponse.json({
+      success: true,
+      upload_id: uploadId,
+      semana_iso: semanaRecente,
+      resumo: resultado.resumo_geral,
+    })
+  } catch (e: unknown) {
+    console.error('[processar]', e)
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : 'Erro interno' },
+      { status: 500 }
+    )
+  }
+}

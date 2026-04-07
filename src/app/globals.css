@@ -3,25 +3,56 @@
 @tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+  --c-primary: #1E40AF;
+  --c-primary-dark: #1E3A8A;
+  --c-primary-light: #3B82F6;
+  --c-accent: #F59E0B;
+  --c-bg: #F1F5F9;
+  --c-surface: #FFFFFF;
+  --c-border: #E2E8F0;
+  --c-text: #0F172A;
+  --c-muted: #64748B;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --c-critico: #DC2626;
+  --c-critico-bg: #FEF2F2;
+  --c-alerta: #D97706;
+  --c-alerta-bg: #FFFBEB;
+  --c-ok: #059669;
+  --c-ok-bg: #F0FDF4;
+  --c-excesso: #2563EB;
+  --c-excesso-bg: #EFF6FF;
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  color: var(--c-text);
+  background: var(--c-bg);
+  font-family: 'Fira Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+code, .mono {
+  font-family: 'Fira Code', 'Courier New', monospace;
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+
+  .status-critico {
+    color: var(--c-critico);
+    background: var(--c-critico-bg);
+  }
+  .status-alerta {
+    color: var(--c-alerta);
+    background: var(--c-alerta-bg);
+  }
+  .status-ok {
+    color: var(--c-ok);
+    background: var(--c-ok-bg);
+  }
+  .status-excesso {
+    color: var(--c-excesso);
+    background: var(--c-excesso-bg);
   }
 }
